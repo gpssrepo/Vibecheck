@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VibeCheck</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-6">
+  <div class="max-w-xl mx-auto space-y-6">
+    <header class="text-center">
+      <h1 class="text-3xl font-extrabold text-indigo-400">⚡ VibeCheck</h1>
+      <p class="text-slate-400 text-sm">Real-time crowdsourced sentiment powered by Supabase &amp; Claude</p>
+      <p id="status" class="text-xs text-slate-500 mt-1">Connecting…</p>
+    </header>
+
+    <!-- Setup warning (hidden once configured) -->
+    <div id="setupWarn" class="hidden bg-amber-950/40 border border-amber-500/40 text-amber-200 text-sm p-3 rounded-xl">
+      Add your Supabase URL and anon key in the <code>CONFIG</code> block at the top of the script.
+    </div>
+
+    <!-- Input -->
+    <form id="form" class="bg-slate-800 p-4 rounded-xl shadow-lg border border-slate-700 space-y-3">
+      <input id="msgInput" type="text" maxlength="280" autocomplete="off"
+        placeholder="How are you feeling about the event right now?"
+        class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-indigo-500" />
+      <button id="submitBtn" type="submit"
+        class="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 font-semibold py-2 rounded-lg transition">
+        Drop Vibe
+      </button>
+    </form>
+
+    <!-- AI Summary -->
+    <div class="bg-indigo-950/40 border border-indigo-500/30 p-4 rounded-xl space-y-2">
+      <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-wider">🤖 Claude's Live Vibe Summary</h2>
+      <div id="aiSummary" class="text-slate-300 text-sm space-y-2">
+        <p class="italic">Waiting for more vibes to summarize...</p>
+      </div>
+    </div>
+
+    <!-- Live feed -->
+    <div class="space-y-2">
+      <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider">
+        Live Feed <span id="count" class="text-slate-500 normal-case font-normal"></span>
+      </h2>
+      <div id="feed" class="space-y-2 max-h-72 overflow-y-auto pr-1"></div>
+    </div>
+  </div>
+
+  <script>
+    // ---------- CONFIG ----------
+    // Both values are safe to expose in the browser (access is controlled by RLS).
+    // The Anthropic key is NOT here: it lives in the Edge Function as a secret.
+    const CONFIG = {
+      SUPABASE_URL: 'https://toqtskrkrrxzjacmhgdk.supabase.co',
+      SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvcXRza3JrcnJ4emphY21oZ2RrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM2MTQ0MTQsImV4cCI6MjEwOTE5MDQxNH0.pei-WyNeP94e2NbmkjlPEP5woml8RRTDnqYfpnYfZY0', // legacy anon JWT (the summarize function verifies a JWT)
+      SUMMARY_DEBOUNCE_MS: 2500,                  // batch bursts of messages into one Claude call
+    };
+    // ----------------------------
+
+    const $ = (id) => document.getElementById(id);
+    const configured = !CONFIG.SUPABASE_URL.startsWith('YOUR_') && !CONFIG.SUPABASE_ANON_KEY.startsWith('YOUR_');
+
+    // Never inject user text as HTML.
+    function el(tag, className, text) {
+      const n = document.createElement(tag);
+      if (className) n.className = className;
+      if (text !== undefined) n.textContent = text;
+      return n;
+    }
+
+    function renderFeed(rows) {
+      const feed = $('feed');
+      feed.replaceChildren(...rows.map((r) =>
+        el('div', 'bg-slate-800/60 p-2.5 rounded-lg text-sm border border-slate-700/50', r.message)
+      ));
+      $('count').textContent = rows.length ? `(latest ${rows.length})` : '';
+    }
+
+    function renderSummary(text) {
+      const box = $('aiSummary');
+      const parts = text.split('\n').map((l) => l.trim()).filter(Boolean);
+      const nodes = parts.map((line) => {
+        const m = line.match(/^(VIBE|ACTION):\s*(.*)$/i);
+        const p = el('p');
+        if (m) {
+          p.append(el('span', 'font-semibold text-indigo-300 mr-1', m[1].toUpperCase() + ':'), document.createTextNode(m[2]));
+        } else {
+          p.textContent = line;
+        }
+        return p;
+      });
+      box.replaceChildren(...nodes);
+    }
+
+    if (!configured) {
+      $('setupWarn').classList.remove('hidden');
+      $('status').textContent = 'Not configured';
+      $('submitBtn').disabled = true;
+    } else {
+      const sb = window.supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
+
+      async function loadFeed() {
+        const { data, error } = await sb.from('feedback')
+          .select('message')
+          .order('created_at', { ascending: false })
+          .limit(20);
+        if (error) { console.error(error); $('status').textContent = 'Could not load feed'; return 0; }
+        renderFeed(data);
+        return data.length;
+      }
+
+      async function summarize() {
+        try {
+          const res = await fetch(`${CONFIG.SUPABASE_URL}/functions/v1/summarize`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${CONFIG.SUPABASE_ANON_KEY}`,
+              'apikey': CONFIG.SUPABASE_ANON_KEY,
+            },
+            body: '{}',
+          });
+          const out = await res.json();
+          if (!res.ok || out.error) throw new Error(out.error || res.statusText);
+          if (out.summary) renderSummary(out.summary);
+        } catch (e) {
+          console.error(e);
+          $('aiSummary').replaceChildren(el('p', 'italic text-slate-500', 'Summary unavailable right now (is the summarize function deployed?).'));
+        }
+      }
+
+      // Debounce so a burst of messages triggers a single Claude call.
+      let timer;
+      const scheduleSummary = () => { clearTimeout(timer); timer = setTimeout(summarize, CONFIG.SUMMARY_DEBOUNCE_MS); };
+
+      $('form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const input = $('msgInput');
+        const message = input.value.trim();
+        if (!message) return;
+        $('submitBtn').disabled = true;
+        const { error } = await sb.from('feedback').insert([{ message }]);
+        $('submitBtn').disabled = false;
+        if (error) { console.error(error); $('status').textContent = 'Failed to post'; return; }
+        input.value = '';
+        input.focus();
+      });
+
+      // Realtime: refresh feed on every insert, summarize (debounced).
+      sb.channel('public:feedback')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'feedback' }, () => {
+          loadFeed();
+          scheduleSummary();
+        })
+        .subscribe((status) => {
+          $('status').textContent = status === 'SUBSCRIBED' ? '● Live' : status.toLowerCase();
+        });
+
+      // Initial load
+      loadFeed().then((n) => { if (n > 0) summarize(); });
+    }
+  </script>
+</body>
+</html>
